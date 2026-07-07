@@ -18,6 +18,11 @@ brew install --HEAD itisbryan/tap/paracli
 
 Or just drop `bin/paracli` on your PATH (it needs only `ruby` + `git`).
 
+The `itisbryan/tap/paracli` formula is auto-bumped when a stable tag like `v0.1.0`
+is pushed (see `.github/workflows/bump-homebrew-tap.yml`). It requires a repository
+secret named `TAP_TOKEN` with write access to `itisbryan/homebrew-tap` (and permission
+to bypass branch protection if the tap's default branch is protected).
+
 ## Prerequisites
 
 - `ruby` (3.x+) and `git`.
