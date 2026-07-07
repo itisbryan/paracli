@@ -1,0 +1,98 @@
+name: Bump Homebrew Tap
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+
+concurrency:
+  group: bump-homebrew-tap
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Compute version from tag
+        id: meta
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: Download and verify source tarball
+        id: sha
+        run: |
+          URL="https://github.com/${{ github.repository }}/archive/refs/tags/${{ github.ref_name }}.tar.gz"
+          curl -fsSL "$URL" -o paracli.tar.gz
+          tar -xzf paracli.tar.gz
+          cd "paracli-${{ env.VERSION }}"
+          ACTUAL_VERSION=$(ruby bin/paracli version | awk '{print $2}')
+          if [ "$ACTUAL_VERSION" != "${{ env.VERSION }}" ]; then
+            echo "Version mismatch: tag is ${{ env.VERSION }}, bin/paracli reports $ACTUAL_VERSION" >&2
+            exit 1
+          fi
+          cd ..
+          SHA=$(sha256sum paracli.tar.gz | cut -d' ' -f1)
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "SHA=$SHA" >> "$GITHUB_ENV"
+
+      - name: Checkout tap repository
+        uses: actions/checkout@v4
+        with:
+          repository: itisbryan/homebrew-tap
+          token: ${{ secrets.TAP_TOKEN }}
+          path: homebrew-tap
+
+      - name: Update Formula/paracli.rb
+        run: |
+          mkdir -p homebrew-tap/Formula
+          cat > homebrew-tap/Formula/paracli.rb <<'FORMULA'
+          class Paracli < Formula
+            desc "Draft and submit Parabol daily standups from git activity"
+            homepage "https://github.com/itisbryan/paracli"
+            url "https://github.com/itisbryan/paracli/archive/refs/tags/v${{ env.VERSION }}.tar.gz"
+            version "${{ env.VERSION }}"
+            sha256 "${{ env.SHA }}"
+            license "MIT"
+            head "https://github.com/itisbryan/paracli.git", branch: "main"
+
+            depends_on "ruby"
+
+            def install
+              libexec.install "bin/paracli"
+              (bin/"paracli").write_env_script libexec/"paracli", PATH: "#{Formula["ruby"].opt_bin}:$PATH"
+              pkgshare.install "com.itisbryan.paracli.plist"
+            end
+
+            def caveats
+              <<~EOS
+                Optional launchd agent:
+                  cp #{opt_pkgshare}/com.itisbryan.paracli.plist ~/Library/LaunchAgents/
+                  launchctl load ~/Library/LaunchAgents/com.itisbryan.paracli.plist
+
+                Set PARABOL_TOKEN in your environment before running paracli.
+              EOS
+            end
+
+            test do
+              assert_match version.to_s, shell_output("#{bin}/paracli version")
+            end
+          end
+          FORMULA
+
+      - name: Commit and push formula update
+        run: |
+          cd homebrew-tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/paracli.rb
+          if git diff --cached --quiet; then
+            echo "Formula already up to date; nothing to commit."
+            exit 0
+          fi
+          git commit -m "bump: paracli ${{ github.ref_name }}"
+          git push
