@@ -1,0 +1,422 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# paracli — draft and submit your Parabol daily standup from git activity.
+# Discover repos → gather git → draft → notify (ntfy) to approve → submit to Parabol.
+# Ruby stdlib only, no gems. Works with any agent or none.
+#
+# Commands (full reference: README.md):
+#   list                          active standup meetings you're in
+#   submit <meetingId> [file|-] --yes   post plaintext as your response (needs --yes)
+#   introspect                    print the submit mutation's args (schema/auth check)
+#   init                          index the repos where I commit → the JSON config
+#   discover                      print candidate work repos (what init would index)
+#   config                        show resolved settings + index path
+#   gather                        print my git activity across indexed/scanned repos
+#   draft [file|-]                draft from gathered activity (mechanical, or $PARACLI_DRAFT_CMD)
+#   notify <file>                 push a draft to ntfy with Approve/Reject buttons
+#   run                           full daily flow (what launchd runs)
+#   version | --selftest
+#
+# Config: a JSON index at ~/.config/paracli/config.json ($PARACLI_CONFIG) records which
+# repos/roots to fetch work from — build it with `paracli init`. Every setting resolves
+# env var > config file > default. Keys: repos[], roots[], since, template, meeting_id, authors[].
+
+require "net/http"
+require "uri"
+require "json"
+require "open3"
+require "fileutils"
+require "time"
+
+VERSION = "0.1.0"
+PARABOL_ENDPOINT = ENV["PARABOL_ENDPOINT"].to_s.empty? ? "https://action.parabol.co/graphql" : ENV["PARABOL_ENDPOINT"]
+CONFIG_PATH = ENV["PARACLI_CONFIG"].to_s.empty? ? File.join(Dir.home, ".config", "paracli", "config.json") : ENV["PARACLI_CONFIG"]
+CANDIDATE_ROOTS = %w[Desktop code src projects work dev repos Documents].map { |d| File.join(Dir.home, d) }
+# Path segments that mean "not my work" — vendored deps, build output, caches.
+IGNORE_SEGMENTS = %w[node_modules vendor tmp .bundle Pods .terraform dist build .cache .git].freeze
+
+def env(k, default = nil) = ENV[k].to_s.empty? ? default : ENV[k]
+def die(msg) = (warn(msg); exit(1))
+
+# ── config: the JSON index + setting resolution ──────────────────────────────
+# Precedence for every setting: env var > config file > built-in default.
+
+def load_config
+  return {} unless File.exist?(CONFIG_PATH)
+  JSON.parse(File.read(CONFIG_PATH))
+rescue JSON::ParserError => e
+  warn "config parse error (#{CONFIG_PATH}): #{e.message}; ignoring it."
+  {}
+end
+CONFIG = load_config
+def cfg(key, default = nil) = CONFIG.fetch(key.to_s, default)
+
+# Pure (selftest-checkable). Explicit repos configured → don't also scan a root.
+def resolve_roots(env_roots, cfg_roots, has_explicit, home)
+  return env_roots.split(":") if env_roots && !env_roots.empty?
+  return Array(cfg_roots) if cfg_roots && !Array(cfg_roots).empty?
+  return [] if has_explicit
+  [File.join(home, "Desktop")]
+end
+
+def explicit_repos = Array(cfg("repos")).map { |p| File.expand_path(p) }
+def roots = resolve_roots(env("PARACLI_ROOTS"), cfg("roots"), !explicit_repos.empty?, Dir.home)
+def since_window = env("PARACLI_SINCE", cfg("since", "yesterday 06:00"))
+def extra_authors = env("PARACLI_AUTHORS", (cfg("authors") || []).join(",")).to_s.split(",").map(&:strip).reject(&:empty?)
+def template_setting = env("PARACLI_TEMPLATE", cfg("template", "full"))
+def configured_meeting_id = env("PARACLI_MEETING_ID", cfg("meeting_id"))
+
+# ── Parabol GraphQL API ──────────────────────────────────────────────────────
+
+def token = env("PARABOL_TOKEN") || die("set PARABOL_TOKEN to your Parabol personal access token " \
+                                         "(profile settings → Tokens; scopes: USERS_READ, TEAMS_READ, MEETINGS_READ, MEETINGS_WRITE).")
+
+def gql(query, variables = {})
+  uri = URI(PARABOL_ENDPOINT)
+  http = Net::HTTP.new(uri.host, uri.port); http.use_ssl = (uri.scheme == "https"); http.read_timeout = 30
+  req = Net::HTTP::Post.new(uri)
+  req["Authorization"] = "Bearer #{token}"; req["Content-Type"] = "application/json"
+  req.body = JSON.generate(query: query, variables: variables)
+  res = http.request(req)
+  die("HTTP #{res.code} from #{PARABOL_ENDPOINT}: #{res.body.to_s[0, 400]}") unless res.is_a?(Net::HTTPSuccess)
+  data = JSON.parse(res.body)
+  die("GraphQL error: #{JSON.pretty_generate(data["errors"])}") if data["errors"]
+  data["data"]
+rescue SocketError, Errno::ECONNREFUSED, Net::OpenTimeout => e
+  die("cannot reach #{PARABOL_ENDPOINT}: #{e.message}")
+end
+
+# Plaintext → stringified TipTap/ProseMirror doc (server converts it back to plaintext).
+def text_to_tiptap(text)
+  paras = text.gsub("\r\n", "\n").split("\n", -1).map do |line|
+    line.strip.empty? ? { type: "paragraph" } : { type: "paragraph", content: [{ type: "text", text: line }] }
+  end
+  paras = [{ type: "paragraph" }] if paras.empty?
+  JSON.generate(type: "doc", content: paras)
+end
+
+# Pure: filter teamPrompt meetings from a viewer.teams array → [[team, name, id], …].
+def teamprompt_meetings(teams)
+  (teams || []).flat_map do |t|
+    (t["activeMeetings"] || []).select { |m| m["meetingType"] == "teamPrompt" }
+                               .map { |m| [t["name"], m["name"], m["id"]] }
+  end
+end
+
+def find_active_meetings
+  data = gql("query { viewer { teams { id name activeMeetings { id meetingType name } } } }")
+  teamprompt_meetings(data["viewer"]["teams"])
+end
+
+def cmd_list
+  found = find_active_meetings
+  return puts("No active standup meetings. Open/start the standup in Parabol first.") if found.empty?
+  puts "Active standups:"
+  found.each { |team, name, id| puts "  #{id}\t[#{team}] #{name}" }
+end
+
+def active_meeting_id
+  return configured_meeting_id if configured_meeting_id
+  found = find_active_meetings
+  die("no active standup (open one in Parabol, or set meeting_id).") if found.empty?
+  warn("multiple active standups; using #{found.first[2]}. Set meeting_id to pin.") if found.size > 1
+  found.first[2]
+end
+
+# Upsert my response for a meeting; returns the response id. No confirmation here.
+def post_response(meeting_id, text)
+  m = <<~GQL
+    mutation Submit($meetingId: ID!, $content: String!) {
+      upsertTeamPromptResponse(meetingId: $meetingId, content: $content) {
+        ... on ErrorPayload { error { message } }
+        ... on UpsertTeamPromptResponseSuccess { teamPromptResponse { id } }
+      }
+    }
+  GQL
+  res = gql(m, { meetingId: meeting_id, content: text_to_tiptap(text) })["upsertTeamPromptResponse"]
+  die("submit failed: #{res["error"]["message"]}") if res["error"]
+  res["teamPromptResponse"]["id"]
+end
+
+# The CLI does not ask — asking is the caller's job (an agent in chat, or the ntfy push).
+# This just requires the confirmation SIGNAL: --yes. Without it, preview and refuse.
+def confirmed_to_submit?(meeting_id, text, yes_flag)
+  warn "── will submit to #{meeting_id} ──\n#{text}\n──────────────────────────────"
+  return true if yes_flag
+  warn "preview only — not submitted. Pass --yes once the human has approved (via the agent or ntfy)."
+  false
+end
+
+def cmd_submit(meeting_id, path, yes_flag)
+  text = (path && path != "-" ? File.read(path) : $stdin.read).strip
+  die("empty update — nothing to submit.") if text.empty?
+  return unless confirmed_to_submit?(meeting_id, text, yes_flag)
+  puts "submitted ✓  response id: #{post_response(meeting_id, text)}"
+end
+
+def cmd_introspect
+  q = "query { __type(name: \"Mutation\") { fields { name args { name type { kind name ofType { kind name } } } } } }"
+  field = gql(q)["__type"]["fields"].find { |f| f["name"] == "upsertTeamPromptResponse" }
+  puts(field ? JSON.pretty_generate(field) : "upsertTeamPromptResponse not found — schema may have changed.")
+end
+
+# ── repo discovery + git gather ──────────────────────────────────────────────
+
+def git(repo, *args)
+  out, = Open3.capture2("git", "-C", repo, *args)
+  out
+rescue StandardError
+  ""
+end
+
+def discover_repos(dirs)
+  dirs.flat_map do |root|
+    root = File.expand_path(root)
+    next [] unless File.directory?(root)
+    Dir.glob(File.join(root, "**/.git"), File::FNM_DOTMATCH)
+       .select { |g| File.directory?(g) }.map { |g| File.dirname(g) }
+  end.uniq.reject { |repo| (repo.split(File::SEPARATOR) & IGNORE_SEGMENTS).any? }
+end
+
+# My identities in a repo: name AND every email I use (git --author is repeatable = OR).
+# Commits often use a GitHub noreply email ≠ config user.email, so both together capture all.
+def my_author_ids(repo)
+  ([git(repo, "config", "user.name"), git(repo, "config", "user.email")] + extra_authors)
+    .map(&:strip).reject(&:empty?).uniq
+end
+
+# Commit subjects I authored since `window` (empty if none). One source of truth for
+# "did I work here", used by both gather and discovery.
+def my_commit_lines(repo, window)
+  ids = my_author_ids(repo)
+  return [] if ids.empty?
+  git(repo, "log", "--since=#{window}", *ids.map { |a| "--author=#{a}" }, "--pretty=%s", "--no-merges")
+    .lines.map(&:strip).reject(&:empty?)
+end
+
+def gather
+  (discover_repos(roots) + explicit_repos).uniq.filter_map do |repo|
+    commits = my_commit_lines(repo, since_window)
+    next if commits.empty?
+    wip = git(repo, "status", "-s").lines.map(&:strip).reject(&:empty?)
+    { repo: File.basename(repo), commits: commits, wip: wip }
+  end
+end
+
+def discover_work_repos(days = 90)
+  scan = env("PARACLI_ROOTS") ? env("PARACLI_ROOTS").split(":") : (cfg("roots") || CANDIDATE_ROOTS)
+  discover_repos(scan).select { |repo| my_commit_lines(repo, "#{days} days ago").any? }
+end
+
+def gather_text(data)
+  return "(no commits found in the window)" if data.empty?
+  data.map do |r|
+    lines = ["## #{r[:repo]}"] + r[:commits].map { |c| "- #{c}" }
+    lines << "- (in progress, uncommitted: #{r[:wip].size} file(s))" unless r[:wip].empty?
+    lines.join("\n")
+  end.join("\n\n")
+end
+
+# ── drafting (mechanical by default; optional agent CLI via $PARACLI_DRAFT_CMD) ──
+
+def draft_prompt(activity, template = template_setting)
+  shape = if template == "today"
+    "Today:\n- <what I'm working on today, from my recent work and anything in progress>\n"
+  else
+    "Yesterday:\n- <outcomes, not commit messages; collapse related commits>\n" \
+    "Today:\n- <what I'm continuing / picking up>\n" \
+    "Blockers:\n- <only if evident, else \"none\">\n"
+  end
+  <<~PROMPT
+    You are writing MY daily standup from my raw git activity below. Output ONLY the
+    standup as plain text in exactly this shape, nothing else (no preamble, no markdown):
+
+    #{shape}
+    Keep it tight, engineer's voice. Group by project when it helps. Activity:
+
+    #{activity}
+  PROMPT
+end
+
+# Default mechanical (deterministic, no LLM). Set $PARACLI_DRAFT_CMD to any agent CLI that
+# reads a prompt on stdin and prints a draft ("claude -p", "llm", "codex exec", …).
+def draft(activity)
+  cmd = env("PARACLI_DRAFT_CMD")
+  return mechanical_draft(activity) unless cmd
+  out, err, status = Open3.capture3("/bin/sh", "-c", cmd, stdin_data: draft_prompt(activity))
+  return out.strip if status.success? && !out.strip.empty?
+  warn "draft cmd (#{cmd}) failed: #{err.to_s.strip[0, 120]}; mechanical draft."
+  mechanical_draft(activity)
+rescue StandardError => e
+  warn "draft cmd error (#{e.message}); mechanical draft."
+  mechanical_draft(activity)
+end
+
+def mechanical_draft(activity, template = template_setting)
+  return "Today:\n#{activity}" if template == "today"
+  "Yesterday:\n#{activity}\n\nToday:\n- (continuing the above)\n\nBlockers:\n- none"
+end
+
+# ── ntfy notify + approval wait ──────────────────────────────────────────────
+
+def ntfy_base = env("PARACLI_NTFY_SERVER", "https://ntfy.sh")
+def ntfy_topic = env("PARACLI_NTFY_TOPIC") || die("set PARACLI_NTFY_TOPIC (a secret topic name).")
+def reply_topic = "#{ntfy_topic}-reply"
+
+def http_post(url, body, headers = {})
+  uri = URI(url)
+  http = Net::HTTP.new(uri.host, uri.port); http.use_ssl = (uri.scheme == "https")
+  req = Net::HTTP::Post.new(uri); headers.each { |k, v| req[k] = v }
+  req.body = body
+  http.request(req)
+end
+
+def notify(draft_text)
+  reply = "#{ntfy_base}/#{reply_topic}"
+  payload = {
+    topic: ntfy_topic, title: "Standup draft — approve?", message: draft_text, priority: 4,
+    actions: [
+      { action: "http", label: "✅ Approve", url: reply, method: "POST", body: "approve", clear: true },
+      { action: "http", label: "❌ Reject",  url: reply, method: "POST", body: "reject",  clear: true }
+    ]
+  }
+  res = http_post(ntfy_base, JSON.generate(payload), "Content-Type" => "application/json")
+  die("ntfy notify failed: HTTP #{res.code} #{res.body.to_s[0, 200]}") unless res.is_a?(Net::HTTPSuccess)
+end
+
+def push(message, title: "paracli")
+  http_post(ntfy_base, JSON.generate(topic: ntfy_topic, title: title, message: message),
+            "Content-Type" => "application/json")
+end
+
+def wait_approval(timeout)
+  started = Time.now.to_i
+  poll = "#{ntfy_base}/#{reply_topic}/json?poll=1&since=#{started}"
+  while Time.now.to_i < started + timeout
+    begin
+      Net::HTTP.get(URI(poll)).each_line do |line|
+        msg = JSON.parse(line) rescue nil
+        next unless msg && msg["event"] == "message"
+        case msg["message"].to_s.strip.downcase
+        when "approve" then return :approve
+        when "reject"  then return :reject
+        end
+      end
+    rescue StandardError
+      # transient — keep polling
+    end
+    sleep 5
+  end
+  :timeout
+end
+
+# ── commands ─────────────────────────────────────────────────────────────────
+
+def cmd_init
+  repos = discover_work_repos
+  data = load_config
+  data["repos"] = repos
+  data["since"] ||= "yesterday 06:00"
+  data["template"] ||= "full"
+  FileUtils.mkdir_p(File.dirname(CONFIG_PATH))
+  File.write(CONFIG_PATH, JSON.pretty_generate(data) + "\n")
+  warn "indexed #{repos.size} repo(s) → #{CONFIG_PATH}  (edit the file to add/remove any)"
+  puts JSON.pretty_generate(data)
+end
+
+def cmd_discover = puts(JSON.pretty_generate(discover_work_repos))
+
+def cmd_config
+  puts JSON.pretty_generate(
+    "config_path" => CONFIG_PATH, "exists" => File.exist?(CONFIG_PATH),
+    "resolved" => { "roots" => roots, "repos" => explicit_repos, "since" => since_window,
+                    "template" => template_setting, "meeting_id" => configured_meeting_id, "authors" => extra_authors }
+  )
+end
+
+def cmd_run
+  data = gather
+  if data.empty?
+    push("No commits since #{since_window} — no standup drafted."); warn "nothing to report."; return
+  end
+  text = draft(gather_text(data))
+  cache = File.join(Dir.home, ".cache", "paracli"); FileUtils.mkdir_p(cache)
+  File.write(File.join(cache, "draft-#{Time.now.strftime('%F')}.txt"), text)
+
+  notify(text)
+  warn "notified; waiting for approval…"
+  case wait_approval(env("PARACLI_APPROVE_TIMEOUT", "10800").to_i)
+  when :approve
+    return push("Approved, but PARACLI_DRAFT_ONLY is set — not submitted.") if env("PARACLI_DRAFT_ONLY") == "1"
+    id = post_response(active_meeting_id, text)     # ntfy tap is the confirmation
+    push("✅ Standup submitted to Parabol.\n\n#{text}", title: "Standup submitted")
+    warn "submitted ✓ #{id}"
+  when :reject
+    push("❌ Standup rejected — not submitted. Edit and rerun `paracli run`."); warn "rejected."
+  else
+    push("⌛️ No response in time — standup not submitted."); warn "timed out."
+  end
+end
+
+# ── selftest (pure logic, offline) ───────────────────────────────────────────
+
+def selftest
+  raise "tiptap" unless JSON.parse(text_to_tiptap("a\n\nb"))["content"][1] == { "type" => "paragraph" }
+  m = teamprompt_meetings([{ "name" => "ampo", "activeMeetings" => [
+    { "id" => "X", "meetingType" => "teamPrompt", "name" => "Standup" },
+    { "id" => "Y", "meetingType" => "retrospective", "name" => "Retro" }] }])
+  raise "meeting filter" unless m == [["ampo", "Standup", "X"]]
+  t = gather_text([{ repo: "omnicore", commits: ["feat: x"], wip: ["a.rb"] }])
+  raise "repo header" unless t.include?("## omnicore") && t.include?("uncommitted: 1 file")
+  raise "empty" unless gather_text([]).start_with?("(no commits")
+  d = mechanical_draft("## r\n- x", "full")
+  %w[Yesterday: Today: Blockers:].each { |s| raise "section #{s}" unless d.include?(s) }
+  today = mechanical_draft("## r\n- x", "today")
+  raise "today-only" unless today.start_with?("Today:") && !today.include?("Blockers:")
+  raise "roots env"      unless resolve_roots("/a:/b", ["/c"], false, "/h") == ["/a", "/b"]
+  raise "roots cfg"      unless resolve_roots(nil, ["/c"], false, "/h") == ["/c"]
+  raise "roots explicit" unless resolve_roots(nil, nil, true, "/h") == []
+  raise "roots default"  unless resolve_roots(nil, nil, false, "/h") == ["/h/Desktop"]
+  puts "selftest: ok"
+end
+
+# ── dispatch ─────────────────────────────────────────────────────────────────
+
+case ARGV[0]
+when nil, "-h", "--help"
+  puts <<~USAGE
+    paracli #{VERSION} — Parabol daily standup from git activity.
+      list                            active standup meetings
+      submit <meetingId> [file|-] --yes   post plaintext (needs --yes)
+      introspect                      submit mutation args (schema/auth check)
+      init | discover | config        build/inspect the repo index (#{CONFIG_PATH})
+      gather                          my git activity across indexed/scanned repos
+      draft [file|-]                  draft from activity (mechanical, or $PARACLI_DRAFT_CMD)
+      notify <file>                   push a draft to ntfy with Approve/Reject
+      run                             full daily flow (launchd)
+      version | --selftest
+    First run: `paracli init`. Config precedence: env > config file > default. See README.md.
+  USAGE
+when "version", "--version" then puts "paracli #{VERSION}"
+when "--selftest"           then selftest
+when "list"                 then cmd_list
+when "submit"
+  yes = !!ARGV.delete("--yes"); a = ARGV[1..]
+  a[0] ? cmd_submit(a[0], a[1], yes) : die("usage: submit <meetingId> [file|-] --yes")
+when "introspect" then cmd_introspect
+when "init"       then cmd_init
+when "discover"   then cmd_discover
+when "config"     then cmd_config
+when "gather"     then puts gather_text(gather)
+when "draft"
+  activity = case ARGV[1]
+             when nil then gather_text(gather)
+             when "-" then STDIN.read
+             else File.read(ARGV[1])
+             end
+  puts draft(activity)
+when "notify" then ARGV[1] ? notify(File.read(ARGV[1])) : die("usage: notify <file>")
+when "run"    then cmd_run
+else die("unknown command: #{ARGV[0]} — run `paracli --help`")
+end

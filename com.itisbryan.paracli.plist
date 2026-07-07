@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- launchd agent: run paracli's daily standup flow on weekday mornings.
+     Install:
+       cp com.itisbryan.paracli.plist ~/Library/LaunchAgents/
+       launchctl load ~/Library/LaunchAgents/com.itisbryan.paracli.plist
+     Run once now:  launchctl start com.itisbryan.paracli
+     paracli is on PATH (brew), so no absolute script path is needed — zsh -lc sources
+     ~/.zshrc for PATH + PARABOL_TOKEN + PARACLI_* env. -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.itisbryan.paracli</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/zsh</string>
+    <string>-lc</string>
+    <string>source "$HOME/.zshrc" 2>/dev/null; exec paracli run</string>
+  </array>
+  <key>StartCalendarInterval</key>
+  <array>
+    <dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>9</integer><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>9</integer><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>9</integer><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>9</integer><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>9</integer><key>Minute</key><integer>0</integer></dict>
+  </array>
+  <key>RunAtLoad</key>
+  <false/>
+  <key>StandardOutPath</key>
+  <string>/Users/itisbryan/.cache/paracli/launchd.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/itisbryan/.cache/paracli/launchd.log</string>
+</dict>
+</plist>
