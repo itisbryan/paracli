@@ -124,8 +124,27 @@ def active_meeting_id
   found.first[2]
 end
 
+# Join a meeting so the viewer has a MeetingMember row. upsertTeamPromptResponse
+# is protected by isMeetingMember, which checks for that row. Idempotent on server.
+def join_meeting(meeting_id)
+  m = <<~GQL
+    mutation Join($meetingId: ID!) {
+      joinMeeting(meetingId: $meetingId) {
+        ... on ErrorPayload { error { message } }
+        ... on JoinMeetingSuccess { meeting { id } }
+      }
+    }
+  GQL
+  res = gql(m, { meetingId: meeting_id })["joinMeeting"]
+  return unless res["error"]
+  msg = res["error"]["message"]
+  # Already a member is reported as "Could not join meeting" because the insert is a no-op.
+  die("join failed: #{msg}") unless msg.to_s.include?("Could not join meeting")
+end
+
 # Upsert my response for a meeting; returns the response id. No confirmation here.
 def post_response(meeting_id, text)
+  join_meeting(meeting_id)
   m = <<~GQL
     mutation Submit($meetingId: ID!, $content: String!) {
       upsertTeamPromptResponse(meetingId: $meetingId, content: $content) {
@@ -170,13 +189,25 @@ rescue StandardError
   ""
 end
 
+# True if `path` is ignored by its *enclosing* repo — respects .gitignore, nested
+# ignores, .git/info/exclude, and global excludes (everything `git check-ignore` sees).
+# Runs from the parent dir so a repo's own .gitignore doesn't mask the question.
+def git_ignored?(path)
+  _, status = Open3.capture2e("git", "-C", File.dirname(path), "check-ignore", "-q", "--", path)
+  status.success?
+rescue StandardError
+  false
+end
+
 def discover_repos(dirs)
   dirs.flat_map do |root|
     root = File.expand_path(root)
     next [] unless File.directory?(root)
     Dir.glob(File.join(root, "**/.git"), File::FNM_DOTMATCH)
        .select { |g| File.directory?(g) }.map { |g| File.dirname(g) }
-  end.uniq.reject { |repo| (repo.split(File::SEPARATOR) & IGNORE_SEGMENTS).any? }
+  end.uniq
+     .reject { |repo| (repo.split(File::SEPARATOR) & IGNORE_SEGMENTS).any? }
+     .reject { |repo| git_ignored?(repo) }
 end
 
 # My identities in a repo: name AND every email I use (git --author is repeatable = OR).
@@ -349,7 +380,7 @@ def cmd_run
   case wait_approval(env("PARACLI_APPROVE_TIMEOUT", "10800").to_i)
   when :approve
     return push("Approved, but PARACLI_DRAFT_ONLY is set — not submitted.") if env("PARACLI_DRAFT_ONLY") == "1"
-    id = post_response(active_meeting_id, text)     # ntfy tap is the confirmation
+    id = post_response(active_meeting_id, text)     # ntfy tap is the confirmation; post_response joins first
     push("✅ Standup submitted to Parabol.\n\n#{text}", title: "Standup submitted")
     warn "submitted ✓ #{id}"
   when :reject
@@ -378,6 +409,16 @@ def selftest
   raise "roots cfg"      unless resolve_roots(nil, ["/c"], false, "/h") == ["/c"]
   raise "roots explicit" unless resolve_roots(nil, nil, true, "/h") == []
   raise "roots default"  unless resolve_roots(nil, nil, false, "/h") == ["/h/Desktop"]
+  # joinMeeting error handling: already-joined is a no-op, real errors must abort.
+  define_singleton_method(:gql) { |*| { "joinMeeting" => { "error" => { "message" => "Could not join meeting" } } } }
+  join_meeting("alreadyJoined") # should tolerate the no-op insert error
+  define_singleton_method(:gql) { |*| { "joinMeeting" => { "error" => { "message" => "Invalid meeting ID" } } } }
+  begin
+    join_meeting("badId")
+    raise "expected die on invalid meeting"
+  rescue SystemExit => e
+    raise "wrong exit status" unless e.status == 1
+  end
   puts "selftest: ok"
 end
 
