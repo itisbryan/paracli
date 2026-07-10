@@ -29,7 +29,7 @@ require "open3"
 require "fileutils"
 require "time"
 
-VERSION = "0.1.1"
+VERSION = "0.1.2"
 PARABOL_ENDPOINT = ENV["PARABOL_ENDPOINT"].to_s.empty? ? "https://action.parabol.co/graphql" : ENV["PARABOL_ENDPOINT"]
 CONFIG_PATH = ENV["PARACLI_CONFIG"].to_s.empty? ? File.join(Dir.home, ".config", "paracli", "config.json") : ENV["PARACLI_CONFIG"]
 CANDIDATE_ROOTS = %w[Desktop code src projects work dev repos Documents].map { |d| File.join(Dir.home, d) }
